@@ -30,7 +30,9 @@ The connection is placed in the outevents of epoll only after the whole message 
 For the sending of the static files, a zero-copying mechanism is used sing the sendfile() function. Since the sockets are non-blocking and the function does not send all the file at once, the connection structure uses internal offset variables to keep count of the byes sent so that when the connection is scheduled by epoll again, it can resume by sending again data from the right offset. When sendfile reached the end of the file and the bytes sent are 0, the server closes the connection and removes it from epoll.
 
 ### Sending Messages - dynamic files
-The asynctonous part for the dynamic files was not implemented due to the conglomerate homeworks in this period of time, along with the fact that aio operations were not presented to us in labs.. which makes the implemetation time to be much longer. Nevertheless, I plan to finish this part of the homework right after the session of exams since I did enjoy the idea of creating a server with advanced I/O techniques.
+The asyncronous part for the dynamic files was implemented using the aio functions provided by the library "libaio.h".
+
+As a summary, I am dividing the total size of the file into chuncks manageable by a normal sized buffer and create that number of aio operations. As expected, not all events are submitted at once, therefore I need to keep count of them and resubmit after sending all aio buffers finished. When receiving notitification of events finished, I wait for them using aio_getevent() and submit for sending to the client. After having submitted all events and having them finished and sent to the client, connection is closed and aio structures destroyed.
 
 ## Feedback
 I believe the homework is useful the understading of sockets, but the lack of labs (except for the zero-copying one) made it really hard to understand what the homework requested and how does each part work (epoll, aio, sendfile, http, ..).

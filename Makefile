@@ -5,7 +5,7 @@ build: all
 
 all: aws
 
-aws: aws.o sock_util.o http_parser.o
+aws: aws.o sock_util.o http_parser.o -laio
 
 http_parser.o: http_parser.c 
 

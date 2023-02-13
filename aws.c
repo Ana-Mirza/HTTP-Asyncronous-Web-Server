@@ -1,13 +1,3 @@
-/*
- * epoll-based echo server. Uses epoll(7) to multiplex connections.
- *
- * TODO:
- *  - block data receiving when receive buffer is full (use circular buffers)
- *  - do not copy receive buffer into send buffer when send buffer data is
- *      still valid
- *
- * 2011-2017, Operating Systems
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +12,8 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/sendfile.h>
+#include <libaio.h>
+#include <sys/eventfd.h>
 
 #include "util.h"
 #include "debug.h"
@@ -29,6 +21,8 @@
 #include "w_epoll.h"
 #include "aws.h"
 #include "http_parser.h"
+
+#define EVENTS 1
 
 char http_error[BUFSIZ] = "HTTP/1.0 404 File Not Found\r\n"
 		"Date: Sun, 14 January 2023 13:08:16 GMT\r\n"
@@ -53,6 +47,7 @@ static int epollfd;
 enum connection_state {
 	STATE_DATA_RECEIVED,
 	STATE_HEADER_SENDING,
+	STATE_HEADER_SENT,
 	STATE_DATA_SENDING,
 	STATE_DATA_SENT,
 	STATE_CONNECTION_CLOSED,
@@ -65,6 +60,19 @@ struct connection {
 
 	int fd;
 	struct stat *buf;
+
+	/* aio dependencies */
+	struct iocb **piocb;
+	struct iocb *iocb;
+	char **aio_buf;
+	size_t num_aio;
+	io_context_t ctx;
+	int efd;
+	int num_submitted;
+	int num_aio_finished;
+	int total_aio_op;
+	int aio_sent;
+	int last_bytes;
 
 	/* offset in file to be sent */
 	size_t file_offset;
@@ -94,7 +102,7 @@ static int on_path_cb(http_parser *p, const char *buf, size_t len)
 	memcpy(request_path, buf, len);
 
 	return 0;
-}
+};
 
 /* Use mostly null settings except for on_path callback. */
 static http_parser_settings settings_on_path = {
@@ -109,6 +117,16 @@ static http_parser_settings settings_on_path = {
 	/* on_headers_complete */ 0,
 	/* on_message_complete */ 0
 };
+
+/* Add eventfd to epoll */
+int w_epoll_add_efd(int epollfd, int fd, void *ptr)
+{
+	struct epoll_event ev;
+
+	ev.events = EPOLLIN | EPOLLET;
+	ev.data.ptr = ptr;
+	return epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev);
+}
 
 /*
  * Initialize connection structure on given socket.
@@ -126,9 +144,18 @@ static struct connection *connection_create(int sockfd)
 	conn->buf = malloc(sizeof(struct stat));
 	conn->send_offset = 0;
 	conn->send_len = 0;
+	conn->num_aio_finished = 0;
+	conn->aio_sent = 0;
+	conn->num_submitted = 0;
 	memset(conn->recv_buffer, 0, BUFSIZ);
 	memset(conn->send_buffer, 0, BUFSIZ);
 	memset(conn->request_path, 0, BUFSIZ);
+
+	conn->efd = eventfd(0, EFD_NONBLOCK);
+	DIE(conn->efd < 0, "eventfd");
+
+	/* create ctx */
+	io_setup(EVENTS, &conn->ctx);
 
 	return conn;
 }
@@ -156,6 +183,10 @@ static void connection_remove(struct connection *conn)
 	conn->state = STATE_CONNECTION_CLOSED;
 	free(conn->buf);
 	free(conn);
+	/* destroy context */
+	int rc = io_destroy(conn->ctx);
+	DIE(rc < 0, "io_destroy");
+
 	dlog(LOG_INFO, "Connection closed\n");
 }
 
@@ -206,7 +237,6 @@ static enum connection_state receive_message(struct connection *conn)
 		goto remove_connection;
 	}
 
-receive:
 	bytes_recv = recv(conn->sockfd, conn->recv_buffer, BUFSIZ, 0);
 	if (bytes_recv < 0) {		/* error in communication */
 		dlog(LOG_ERR, "Error in communication from: %s\n", abuffer);
@@ -233,11 +263,186 @@ remove_connection:
 	return STATE_CONNECTION_CLOSED;
 }
 
+/* Read file from the disk asyncronously
+ */
+void read_file_aio(struct connection *conn) {
+
+	/* total number of aio operations */
+	int n = conn->file_size / BUFSIZ;
+	if (conn->file_size % BUFSIZ)
+		n++;
+
+	conn->total_aio_op = n;
+	/* submit all operations */
+	if (conn->num_submitted < n && conn->num_submitted) {
+		goto submit;
+	} else if (conn->num_submitted == n) {
+		goto end;
+	}
+
+	/* alloc structures */
+	conn->iocb = malloc(n * sizeof(struct iocb));
+	conn->piocb = malloc(n * sizeof(struct iocb *));
+	conn->aio_buf = malloc(n * sizeof(char*));
+	if (!conn->iocb || !conn->piocb || !conn->aio_buf) {
+		dlog(LOG_ERR, "malloc error");
+		connection_remove(conn);
+	}
+
+	size_t count;
+	for (int i = 0; i < n; i++) {
+		conn->piocb[i] = &conn->iocb[i];
+		conn->aio_buf[i] = malloc(BUFSIZ * sizeof(char));
+
+		/* number of bytes to read in buf */
+		count = BUFSIZ;
+		if (i == n - 1 && conn->file_size % BUFSIZ != 0) {
+			count = conn->file_size % BUFSIZ;
+		}
+
+		io_prep_pread(&conn->iocb[i], conn->fd, conn->aio_buf[i], count,
+					conn->file_offset);
+		io_set_eventfd(&conn->iocb[i], conn->efd);
+
+		/* update offsets */
+		conn->file_offset += count;
+	}
+	
+	conn->last_bytes = count;
+
+	/* remove from out pool */
+	int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+	DIE(rc < 0, "w_epoll_remove_ptr");
+
+submit:
+	rc = io_submit(conn->ctx, n - conn->num_submitted, conn->piocb + conn->num_submitted);
+	DIE(rc < 0, "io_submit");
+
+	conn->num_submitted += rc;
+
+	if (!conn->num_aio_finished) {
+		/* add evetfd in epoll */
+		rc = w_epoll_add_efd(epollfd, conn->efd, conn);
+		DIE(rc < 0, "w_epoll_add_efd");
+	}
+
+end:
+	return;
+}
+
+/* Collect finished aio operations.
+ */
+void collect_aio(struct connection *conn) {
+	/* catch finished operations */
+	struct io_event events[conn->num_submitted];
+	u_int64_t eval;
+
+	int rc = read(conn->efd, &eval, sizeof(eval));
+	DIE(rc < 0, "read");
+
+	/* submit for sending */
+	rc = io_getevents(conn->ctx, eval, eval, events, NULL);
+	DIE(rc != eval, "io_getevents");
+	conn->num_aio_finished += eval;
+
+	/* add to epollout */
+	rc = w_epoll_add_ptr_out(epollfd, conn->sockfd, conn);
+	DIE(rc < 0, "w_epoll_add_ptr_out");
+}
+
 /*
  * Sends dynamic file asyncronously.
  */
+
 void send_dynamic_file(struct connection *conn) {
-	return;
+	if (conn->aio_sent == conn->num_aio_finished)
+		read_file_aio(conn);
+	conn->state = STATE_DATA_SENDING;
+
+	/* check if buffer is sending */
+	if (conn->send_len)
+		goto sending_file;
+
+	if (!conn->num_aio_finished)
+		return;
+
+	if (conn->num_aio_finished > conn->aio_sent) {
+
+		/* number of bytes to be sent */
+		int bytes;
+		if (conn->aio_sent == conn->num_submitted - 1) {
+			bytes = conn->last_bytes;
+		} else {
+			bytes = BUFSIZ;
+		}
+		memcpy(conn->send_buffer, conn->aio_buf[conn->aio_sent], bytes);
+		conn->send_len = bytes;
+
+		/* info about connection */
+		char abuffer[64];
+
+		int rc = get_peer_address(conn->sockfd, abuffer, 64);
+		if (rc < 0) {
+			ERR("get_peer_address");
+			goto remove_connection;
+		}
+
+sending_file:
+		; /* send file */
+		int bytes_sent = send(conn->sockfd, conn->send_buffer + conn->send_offset, conn->send_len, 0);
+		if (bytes_sent < 0) {		/* error in communication */
+			dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
+			goto remove_connection;
+		}
+		if (bytes_sent == 0) {		/* connection closed */
+			dlog(LOG_ERR, "Connection closed to %s\n", abuffer);
+			goto remove_connection;
+		}
+
+		/* update offsets */
+		conn->send_offset += bytes_sent;
+		conn->send_len -= bytes_sent;
+
+		/* check if data was sent */
+		if (conn->send_len) {
+			conn->state = STATE_DATA_SENDING;
+			return;
+		}
+
+		conn->send_offset = 0;
+		conn->aio_sent++;
+
+		/* finished seding all ready buffers */
+		if (conn->aio_sent == conn->num_aio_finished) {
+
+			/* remove from out notifications */
+			int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+			DIE(rc < 0, "w_epoll_remove_ptr");
+
+			/* submit more events if needed */
+			if (conn->num_aio_finished != conn->total_aio_op)
+				read_file_aio(conn);
+			return;
+		}
+	}
+
+	/* finished sending all buffers - close connection */
+	if (conn->aio_sent == conn->total_aio_op) {
+		dlog(LOG_ERR, "All aio buffers sent - closing connection!");
+remove_connection:
+		for (int i = 0; i < conn->total_aio_op; i++) {
+			free(conn->aio_buf[i]);
+		}
+		free(conn->aio_buf);
+
+		int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+		DIE(rc < 0, "w_epoll_remove_ptr");
+
+		/* remove current connection */
+		connection_remove(conn);
+		return;
+	}
+
 }
 
 /*
@@ -279,7 +484,7 @@ static enum connection_state send_message(struct connection *conn)
 
 		/* valid file http reply */
 		char buffer[BUFSIZ];
-		int rc = sprintf(buffer, "HTTP/1.1 200 OK\r\n"
+		sprintf(buffer, "HTTP/1.1 200 OK\r\n"
 		"Date: Sun, 14 January 2023 13:08:16 GMT\r\n"
 		"Server: Apache/2.2.9\r\n"
 		"Last-Modified: Mon, 01 December 2023 14:30:27 GMT\r\n"
@@ -316,6 +521,9 @@ send_header:
 		return STATE_HEADER_SENDING;
 	}
 
+	conn->state = STATE_HEADER_SENT;
+	conn->send_offset = 0;
+
 send_file:
 	/* send static file */
 	if (strstr(conn->request_path, "static") != NULL && conn->fd != -1) {
@@ -346,6 +554,7 @@ send_file:
 
 	} else if (conn->fd != -1) {
 		send_dynamic_file(conn);
+		return STATE_DATA_SENDING;
 	}
 
 	conn->state = STATE_DATA_SENT;
@@ -377,6 +586,13 @@ static void handle_client_request(struct connection *conn)
 	int rc;
 	enum connection_state ret_state;
 
+	/* deal with aio operations */
+	if (conn->state == STATE_DATA_SENDING) {
+		collect_aio(conn);
+		return;
+	}
+
+	/* receive http message from client */
 	ret_state = receive_message(conn);
 	if (ret_state == STATE_CONNECTION_CLOSED)
 		return;
